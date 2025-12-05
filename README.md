@@ -5,10 +5,11 @@ In this version, the core of the architecture is a GNN module.
 
 During training, the model uses the mesh connectivity provided by the simulations to construct the graph. At inference time, the PFEM mesh generation algorithm is employed to build the graph dynamically.
 
+Gmsh alpha-shape is employed as mesher
 ---
 
 ## Cite
-For more details and to cite:
+For more details:
 ```bibtex
 @article{lanteri2025,
          title = {A mesh-based Graph Neural Network approach for surrogate modeling of Lagrangian free surface fluid flows},

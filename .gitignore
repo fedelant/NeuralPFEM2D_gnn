@@ -1,0 +1,5 @@
+npfem/datasets/
+npfem/outputs/
+npfem/__pycache__/
+.hydra/
+.vs/

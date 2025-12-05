@@ -1,0 +1,74 @@
+# --- Simulation Type ---
+dim: 2 # 2D or 3D simulation
+n_material_properties: 2 # Number of material properties
+
+# --- Execution Mode ---
+mode: "train" # ["train", "valid", "test", "fine_tune"] - Note fine_tune added based on code
+
+# --- File Paths ---
+data_path: null
+model_name: "model"
+output_path: "npfem/outputs/"
+output_filename: "predicted"
+model_file: "model.pt"
+
+# --- Hydra Config ---
+hydra:
+  run:
+    dir: ./
+
+# --- Training Control ---
+continue_training: True
+ntraining_steps: 2000000
+nsave_steps: 5000
+
+# --- Evaluation Control ---
+start_eval_model: 500000
+end_eval_model: 1000000
+
+# --- Output Control ---
+print_loss_frequency: "epoch" # ["step", "epoch"]
+compute_errors: True
+vtk_output: True
+compute_stress: True
+
+# --- Model Hyperparameters ---
+batch_size: 1
+input_sequence_length: 6
+
+# --- Architecture ---
+latent_dim: 128
+mlp_hidden_dim: 128
+n_layers: 2
+mp_steps: 10
+
+# --- Normalization & Scaling Weights ---
+spatial_norm_weight: 0.1
+vel_norm_weight: 0.01
+press_norm_weight: 1.0e-6
+rho_norm_scale: 1.0e6
+tau0_norm_scale: 1.0e5
+
+# --- Noise Parameters ---
+vel_noise_weight: 0.015
+press_noise_weight: 0.03
+pos_noise_weight: 0.03
+
+# --- Learning Rate ---
+lr_init: 1.0e-4
+lr_decay: 0.1
+lr_decay_steps: 1e6
+
+# --- Mesh Parameters ---
+remesh_freq: 1
+mesh_size: 0.005
+alpha: 1
+refine: True
+rmin_factor: 0.99
+rmax_factor: 1.01
+
+# --- Other ---
+use_amp: True
+
+# --- Hardware ---
+cuda_device_number: null # int or null

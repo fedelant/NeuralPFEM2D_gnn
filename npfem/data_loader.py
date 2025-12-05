@@ -1,264 +1,247 @@
+"""
+DataLoader for NeuralPFEM.
+
+Provides PyTorch Dataset and DataLoader utilities for:
+- Training on single timesteps (TrainingDataset)
+- Evaluation/testing on full trajectories (PredictionDataset)
+
+Supports simulations stored in HDF5.
+"""
+
+# Dependencies
 import torch
 import numpy as np
+from torch_geometric.data import Data
+from torch_geometric.loader import DataLoader as PyGDataLoader
+from torch.utils.data import Dataset, DataLoader as TorchDataLoader
+import h5py
 
-def load_npz_data(path):
 
+# --- Dataset Classes ---
+
+class TrainingDataset(Dataset):
     """
-    Load data stored in npz format.
+    PyTorch Dataset for supervised training on single timesteps.
 
-    The file format for Python 3.9 or less supports ragged arrays and Python 3.10
-    requires a structured array. This function supports both formats.
-
-    Args:
-        path (str): Path to npz file.
-
-    Returns:
-        data (list): List of tuples of the form (position, velocity, moved_particle).
-    """
-
-    with np.load(path, allow_pickle=True) as data_file:
-        if 'gns_data' in data_file:
-            data = data_file['gns_data']
-        else:
-            data = [item for _, item in data_file.items()]
-    return data
-
-
-class SamplesDataset(torch.utils.data.Dataset):
-
-    """
-    Dataset of sampled trajectories used for training.
-    
-    Each sample is a tuple of the form (position, velocity, moved_particle).
-    position is a numpy array of shape (sequence_length, n_particles, dimension).
-    velocity is a numpy array of shape (sequence_length, n_particles, dimension).
-    particle_move is a numpy array of shape (sequence_length, n_particles, dimension)
-        which tells if a particle was subject to a non-physical move by the PFEM algorithm during a time-step.
-
-    Args:
-        path (str): Path to dataset.
-        input_velocity_steps (int): Length of input sequence.
-
-    Attributes:
-        _data (list): List of tuples of the form (position, velocity, particle_move).
-        _dimension (int): Dimension of the data.
-        _input_velocity_steps (int): Length of input sequence.
-        _data_lengths (list): List of lengths of trajectories in the dataset.
-        _length (int): Total number of samples in the dataset.
-        _precompute_cumlengths (np.array): Precomputed cumulative lengths of trajectories in the dataset.
+    HDF5 structure (group "outputX"):
+        - position: [total_nodes, dims] concatenated across timesteps
+        - velocity: [total_nodes, dims] concatenated across timesteps
+        - pressure: [total_nodes, 1] concatenated across timesteps
+        - offsets: [T+1] cumulative node counts for splitting timesteps
+        - material_properties: [num_props] material properties
     """
 
-    def __init__(self, path, input_velocity_steps):
+    def __init__(self, path, input_length_sequence: int):
         super().__init__()
-        # Data are loaded as list of tuples of the form (position, velocity, moved_particle).
-        self._data = load_npz_data(path)
+        if input_length_sequence < 1:
+            raise ValueError("input_length_sequence must be >= 1")
 
-        #Length of each trajectory in the dataset excluding the input_velocity_steps. May be variable between data
-        self._dimension = self._data[0][0].shape[-1]
-        self._input_velocity_steps = input_velocity_steps
-        self._data_lengths = [x.shape[0] - self._input_velocity_steps for x, _, _, _, _, _, in self._data]
+        self._input_length_sequence = input_length_sequence
+        self._path = path
+
+        # Index all trajectories and count valid training samples
+        with h5py.File(path, "r") as f:
+            self._keys = list(f.keys())
+            self._data_lengths = []
+            for key in self._keys:
+                num_steps = len(f[key]["offsets"]) - 1
+                valid_samples = max(0, num_steps - input_length_sequence)
+                if valid_samples == 0:
+                    print(f"⚠️ Trajectory {key} skipped (only {num_steps} steps)")
+                self._data_lengths.append(valid_samples)
+
         self._length = sum(self._data_lengths)
+        if self._length == 0:
+            raise ValueError(
+                f"No valid samples in {path} with input_length_sequence={input_length_sequence}"
+            )
 
-        # Pre-compute cumulative lengths to allow fast indexing in __getitem__
-        self._precompute_cumlengths = [sum(self._data_lengths[:x]) for x in range(1, len(self._data_lengths) + 1)]
-        self._precompute_cumlengths = np.array(self._precompute_cumlengths, dtype=int)
+        self._cumulative_lengths = np.cumsum([0] + self._data_lengths)
+        print(
+            f"✅ TrainingDataset initialized with {self._length} samples "
+            f"from {len(self._keys)} trajectories"
+        )
 
     def __len__(self):
-
-        """
-        Return length of dataset.
-        
-        Returns:
-            int: Length of dataset.
-        """
-
         return self._length
 
     def __getitem__(self, idx):
+        if not 0 <= idx < self._length:
+            raise IndexError(f"Index {idx} out of bounds (length {self._length})")
 
-        """
-        Returns a training example from the dataset.
-        
-        Args:
-            idx (int): Index of training example.
+        # Locate trajectory and timestep
+        traj_idx = np.searchsorted(self._cumulative_lengths, idx, side="right") - 1
+        local_idx = idx - self._cumulative_lengths[traj_idx]
+        time_idx = self._input_length_sequence + local_idx
+        key = self._keys[traj_idx]
 
-        Returns:
-            tuple: Tuple of the form ((position, velocity, particle_move, n_particles_per_example), next_velocity).
-        """
+        with h5py.File(self._path, "r") as f:
+            grp = f[key]
+            offsets = grp["offsets"][:]
+            offsets_cells = grp["cell_offsets"][:]
 
-        # Select the trajectory.
-        trajectory_idx = np.searchsorted(self._precompute_cumlengths - 1, idx, side="left")
+            def slice_timestep(arr, t):
+                return arr[offsets[t]:offsets[t + 1]]
+            
+            def slice_timestep_cells(arr, t):
+                return arr[offsets_cells[t]:offsets_cells[t + 1]]
 
-        # Compute index of pick along time-dimension of trajectory.
-        start_of_selected_trajectory = self._precompute_cumlengths[trajectory_idx - 1] if trajectory_idx != 0 else 0
-        time_idx = self._input_velocity_steps + (idx - start_of_selected_trajectory)
+            # Node positions
+            node_positions = torch.tensor(
+                slice_timestep(grp["position"], time_idx), dtype=torch.float32
+            )
+            num_nodes, dims = node_positions.shape
 
-        # Prepare training features with the rigth shape.
-        position = self._data[trajectory_idx][0][time_idx-1] # current position
-        velocity = self._data[trajectory_idx][1][time_idx - self._input_velocity_steps:time_idx] # current + previous C velocities
-        velocity = np.transpose(velocity, (1, 0, 2)) # (nparticles, input_velocity_steps, dimension)
-        n_cells = np.transpose(self._data[trajectory_idx][2]) 
-        n_cells = n_cells[time_idx-1] # number of mesh-graph edges at the current step
-        cells = self._data[trajectory_idx][3][time_idx-1]
-        cells = cells[:n_cells, :] # connectivity matrix at the current step
+            # Velocity history [N, seq, dims]
+            vel_hist = [
+                slice_timestep(grp["velocity"], t)
+                for t in range(time_idx - self._input_length_sequence, time_idx)
+            ]
+            input_velocity_hist = torch.tensor(
+                np.stack(vel_hist, axis=0), dtype=torch.float32
+            ).permute(1, 0, 2)
 
-        free_surf = np.transpose(self._data[trajectory_idx][4][time_idx-1]) # free surf particles at the current step TO DO 
-        bound =  np.transpose(self._data[trajectory_idx][5]) # boundary particles at the current step TO DO 
-        
-        # n of particles and edges in the current example
-        n_particles_per_example = position.shape[0] # scalar, nuber of particle is constant
-        n_cells_per_example = cells.shape[0] # vector, number of edges is variable
-        
-        # Training label: next step velocity
-        label = self._data[trajectory_idx][1][time_idx]
+            # Pressure history [N, seq]
+            press_hist = [
+                slice_timestep(grp["pressure"], t).squeeze(-1)
+                for t in range(time_idx - self._input_length_sequence, time_idx)
+            ]
+            input_pressure_hist = torch.tensor(
+                np.stack(press_hist, axis=0), dtype=torch.float32
+            ).permute(1, 0)
 
-        # Training example: ((features), label)
-        training_example = ((position, velocity, cells, free_surf, bound, n_particles_per_example, n_cells_per_example), label)
+            cells = torch.tensor(
+                slice_timestep_cells(grp["cells"], time_idx), dtype=torch.int32
+            )
 
-        return training_example
+            # Targets
+            target_velocity = torch.tensor(
+                slice_timestep(grp["velocity"], time_idx), dtype=torch.float32
+            )
+            target_pressure = torch.tensor(
+                slice_timestep(grp["pressure"], time_idx), dtype=torch.float32
+            )
+            y_target = torch.cat([target_velocity, target_pressure], dim=-1)
 
-def collate_fn(data):
+            # Unified material property vector
+            props = torch.tensor(grp["material_properties"][:], dtype=torch.float32)  # [num_props]
+            props_star = torch.zeros(2)
+            props_star[0] = props[1] / (props[0] * 9.81 * 0.3)
+            props_star[1] = props[2] / 100
+            material_props = props_star#.repeat(num_nodes, 1)  # [N, num_props]
 
+        return Data(
+            dims=dims,
+            position=node_positions,
+            velocity=input_velocity_hist,
+            pressure=input_pressure_hist,
+            cells=cells,
+            y=y_target,
+            material_properties=material_props,  # [N, num_props]
+            num_nodes=num_nodes,
+        )
+
+
+class PredictionDataset(Dataset):
     """
-    Collate function for SamplesDataset.
+    PyTorch Dataset for evaluation/testing on full trajectories.
 
-    Args:
-        data: List of tuples of numpy arrays of the form ((features), label).
-              Length of the list = batch size
-
-    Returns:
-        tuple: Tuple of the form ((features), label).
-               features and labels ar torch tensor where data from batch are stored contiguously
-    """
- 
-    position_list = []
-    velocity_list = []
-    cells_list = []
-    n_particles_per_example_list = []
-    n_cells_per_example_list = []
-    free_list = []
-    bound_list = []
-    label_list = []
-
-    for ((positions, velocities, cells, free_surf, bound, n_particles_per_example, n_cells_per_example), label) in data:
-        position_list.append(positions)
-        velocity_list.append(velocities)
-        cells_list.append(cells)
-        free_list.append(free_surf)
-        bound_list.append(bound)
-        n_particles_per_example_list.append(n_particles_per_example)
-        n_cells_per_example_list.append(n_cells_per_example)
-        label_list.append(label)
-
-    collated_data = (
-        (
-            torch.tensor(np.vstack(position_list)).to(torch.float32).contiguous(),
-            torch.tensor(np.vstack(velocity_list)).to(torch.float32).contiguous(),
-            torch.tensor(np.vstack(cells_list)).to(torch.int).contiguous(),
-            torch.tensor(np.vstack(free_list)).to(torch.bool).contiguous(),
-            torch.tensor(np.hstack(bound_list)).to(torch.bool).contiguous(),
-            torch.tensor(n_particles_per_example_list).contiguous(),
-            torch.tensor(n_cells_per_example_list).contiguous(),
-        ),
-        torch.tensor(np.vstack(label_list)).to(torch.float32).contiguous()
-    )
-
-    return collated_data
-
-
-class TrajectoriesDataset(torch.utils.data.Dataset):
-
-    """
-    Dataset of trajectories for valid/test.
-
-    Each trajectory is a tuple of the form (position, velocity, moved_particle)
-    position is a numpy array of shape (sequence_length, n_particles, dimension)
-    velocity is a numpy array of shape (sequence_length, n_particles, dimension)
-    particle_move is a numpy array of shape (sequence_length, n_particles, dimension)
-        which tells if a particle was subject to a non-physical move by the PFEM algorithm during a time-step
+    HDF5 structure (group "outputX"):
+        - position: [total_nodes, dims] concatenated across timesteps
+        - velocity: [total_nodes, dims] concatenated across timesteps
+        - pressure: [total_nodes, 1] concatenated across timesteps
+        - offsets: [T+1] cumulative node counts for splitting timesteps
+        - material_properties: [num_props] material properties
     """
 
     def __init__(self, path):
         super().__init__()
-
-        # Data are loaded as list of tuples of the form (position, velocity, moved_particle)
-        self._data = load_npz_data(path)
-        self._dimension = self._data[0][0].shape[-1]
-        self._length = len(self._data)
+        self._path = path
+        with h5py.File(path, "r") as f:
+            self._keys = list(f.keys())
+        if not self._keys:
+            raise ValueError(f"No trajectories found in {path}")
+        print(f"✅ PredictionDataset initialized with {len(self._keys)} trajectories")
 
     def __len__(self):
-
-        """
-        Return length of dataset.
-
-        Returns:
-            int: Length of dataset.
-        """
-
-        return self._length
+        return len(self._keys)
 
     def __getitem__(self, idx):
+        if not 0 <= idx < len(self._keys):
+            raise IndexError(f"Index {idx} out of bounds")
 
-        """
-        Returns a valid/test trajectory from the dataset.
+        key = self._keys[idx]
+        with h5py.File(self._path, "r") as f:
+            grp = f[key]
+            offsets = grp["offsets"][:]
+            T = len(offsets) - 1
 
-        Args:
-            idx (int): Index of training example.
+            positions, velocities, pressures = [], [], []
+            for t in range(T):
+                positions.append(grp["position"][offsets[t]:offsets[t + 1]])
+                velocities.append(grp["velocity"][offsets[t]:offsets[t + 1]])
+                pressures.append(grp["pressure"][offsets[t]:offsets[t + 1]].squeeze(-1))
 
-        Returns:
-            tuple: Tuple named,
-              trajectory = (position, velocity, particle_move, n_particles_per_example).
-        """
+            position_tensor = torch.tensor(np.stack(positions, axis=0), dtype=torch.float32)
+            velocity_tensor = torch.tensor(np.stack(velocities, axis=0), dtype=torch.float32)
+            pressure_tensor = torch.tensor(np.stack(pressures, axis=0), dtype=torch.float32)
 
-        position, velocity, n_cells, cells, free_surf, bounds = self._data[idx]
-        position = np.transpose(position, (1, 0, 2))
-        velocity = np.transpose(velocity, (1, 0, 2))
-        n_particles_per_example = position.shape[0]
+            dims = position_tensor.shape[-1]
+            num_nodes = position_tensor.shape[1]
 
-        trajectory = (
-            torch.tensor(position).to(torch.float32).contiguous(),
-            torch.tensor(velocity).to(torch.float32).contiguous(),
-            torch.tensor(cells).to(torch.int).contiguous(),
-            torch.tensor(bounds).to(torch.bool).contiguous(),
-            torch.tensor(free_surf).to(torch.bool).contiguous(),
-            torch.tensor(n_cells).to(torch.int).contiguous(),
-            n_particles_per_example
-        )
+            # Unified material property vector
+            props = torch.tensor(grp["material_properties"][:], dtype=torch.float32)  # [num_props]
+            props_star = torch.zeros(2)
+            props_star[0] = props[1] / (props[0] * 9.81 * 0.3)
+            props_star[1] = props[2] / 100
+            material_props = props_star
 
-        return trajectory
+            angles = torch.tensor(grp["angle"][()], dtype=torch.float32)
+        return Data(
+            dims=dims,
+            position=position_tensor,
+            velocity=velocity_tensor,
+            pressure=pressure_tensor,
+            material_properties=material_props,
+            angles=angles,
+        ), key
+
+# --- DataLoader Utility Functions ---
+
+def get_training_data_loader(
+    path,
+    input_length_sequence: int,
+    batch_size: int,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    **kwargs,
+):
+    """Builds a DataLoader for training (single timesteps)."""
+    dataset = TrainingDataset(path, input_length_sequence)
+    return PyGDataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        **kwargs,
+    )
 
 
-def get_data_loader_by_samples(path, input_velocity_steps, batch_size, shuffle=True):
-    
-    """
-    Returns a pytorch data loader for the training dataset.
-
-    Args:
-        path (str): Path to dataset.
-        input_velocity_steps (int): Length of input sequence.
-        batch_size (int): Batch size.
-        shuffle (bool, optional): Whether to shuffle the dataset. Defaults to True.
-
-    Returns:
-        torch.utils.data.DataLoader: pytorch data loader for the dataset.
-    """
-
-    dataset = SamplesDataset(path, input_velocity_steps)
-    return torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=16,
-                                       pin_memory=True, collate_fn=collate_fn)
-
-
-def get_data_loader_by_trajectories(path):
-    
-    """Returns a data loader for the valid/test dataset.
-
-    Args:
-        path (str): Path to dataset.
-
-    Returns:
-        torch.utils.data.DataLoader: Data loader for the dataset.
-    """
-
-    dataset = TrajectoriesDataset(path)
-    return torch.utils.data.DataLoader(dataset, batch_size=None, shuffle=False,
-                                       pin_memory=True)
+def get_prediction_data_loader(
+    path,
+    num_workers: int = 0,
+    pin_memory: bool = True,
+    **kwargs,
+):
+    """Builds a DataLoader for prediction/evaluation (full trajectories)."""
+    dataset = PredictionDataset(path)
+    return TorchDataLoader(
+        dataset,
+        batch_size=None,  # one trajectory per iteration
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        **kwargs,
+    )

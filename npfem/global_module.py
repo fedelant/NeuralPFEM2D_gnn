@@ -1,0 +1,33 @@
+import numpy as np
+import torch
+class g:
+    coords: np.ndarray
+    tags: np.ndarray
+    cfg: dict
+    boundv: np.ndarray
+    boundp: np.ndarray
+    alone: np.ndarray
+    dim: int
+    V_tn: np.ndarray
+    P_tn: np.ndarray
+    euler: np.ndarray
+    free_surf: np.ndarray
+    neighb: torch.Tensor
+    cells: np.ndarray
+    euler: np.ndarray
+    current_velocity: torch.Tensor
+    current_pressure: torch.Tensor
+    current_position: torch.Tensor
+    next_position: torch.Tensor
+    elements: np.ndarray
+    previous_velocity: torch.Tensor
+    previous_pressure: torch.Tensor
+    tags: np.ndarray
+    material_properties: torch.Tensor
+    angles: torch.Tensor
+    step: int
+    position_gt: torch.Tensor
+    velocity_gt: torch.Tensor
+    pressure_gt: torch.Tensor
+    nsteps_total: int
+    nsteps_predict: int
